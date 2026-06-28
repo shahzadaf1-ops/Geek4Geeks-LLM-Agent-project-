@@ -1,0 +1,687 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Upload, FileText, Image as ImageIcon, Map as MapIcon, 
+  Calculator, Printer, Key, Send, AlertCircle
+} from 'lucide-react';
+
+// --- Utility: Exponential Backoff Fetch for Gemini API ---
+const fetchWithRetry = async (url, options, retries = 5) => {
+  const delays = [1000, 2000, 4000, 8000, 16000];
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error?.message || `HTTP error! status: ${response.status}`);
+      }
+      return await response.json();
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await new Promise(r => setTimeout(r, delays[i]));
+    }
+  }
+};
+
+export default function App() {
+  // --- State Management ---
+  const [apiKey, setApiKey] = useState('');
+  const [isKeyValid, setIsKeyValid] = useState(false);
+  const [activeTab, setActiveTab] = useState('analysis'); // analysis (docs/images), financials, topology (mindmap)
+  const [files, setFiles] = useState([]);
+  const [activeFileId, setActiveFileId] = useState(null);
+  
+  // Chat State
+  const [chatMessages, setChatMessages] = useState([{
+    role: 'model', 
+    text: 'System Initialized: Abu Dhabi Real-Estate Investment Assistant online. Ready to analyze project brochures, payment plans, and compute financial projections for your clients. Please upload source documents to begin.'
+  }]);
+  const [chatInput, setChatInput] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+
+  // Financial State
+  const [financials, setFinancials] = useState({
+    propertyPrice: 2500000,
+    downPaymentPct: 20,
+    annualRent: 180000,
+    annualExpenses: 25000,
+    interestRate: 4.5,
+    loanTermYears: 25
+  });
+
+  const fileInputRef = useRef(null);
+  const chatEndRef = useRef(null);
+
+  // --- Initialization ---
+  useEffect(() => {
+    const loadPdfJs = async () => {
+      if (!window.pdfjsLib) {
+        const script = document.createElement('script');
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js';
+        script.onload = () => {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+        };
+        document.head.appendChild(script);
+      }
+    };
+    loadPdfJs();
+  }, []);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages, isTyping]);
+
+  // --- Handlers ---
+  const handlePrint = () => window.print();
+
+  const handleApiChange = (e) => {
+    const key = e.target.value;
+    setApiKey(key);
+    setIsKeyValid(key.length > 30);
+  };
+
+  const extractTextFromPDF = async (arrayBuffer) => {
+    try {
+      if (!window.pdfjsLib) throw new Error("PDF.js not loaded yet");
+      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      let fullText = "";
+      const pages = [];
+
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+        const pageText = textContent.items.map(item => item.str).join(' ');
+        fullText += `[Page ${i}]: ${pageText}\n`;
+        pages.push({ pageNumber: i, text: pageText });
+      }
+      return { fullText, pages, pageCount: pdf.numPages };
+    } catch (err) {
+      console.error("PDF parsing error:", err);
+      return { fullText: "Error extracting text.", pages: [], pageCount: 0 };
+    }
+  };
+
+  const handleFileUpload = async (e) => {
+    const uploadedFiles = Array.from(e.target.files);
+    
+    for (const file of uploadedFiles) {
+      const id = Math.random().toString(36).substr(2, 9);
+      const isPdf = file.type === 'application/pdf';
+      const isImage = file.type.startsWith('image/');
+      
+      if (!isPdf && !isImage) continue;
+
+      const reader = new FileReader();
+      
+      reader.onload = async (event) => {
+        let content = event.target.result;
+        let textData = null;
+
+        if (isPdf) {
+          const arrayBuffer = await file.arrayBuffer();
+          textData = await extractTextFromPDF(arrayBuffer);
+        }
+
+        const newFile = {
+          id,
+          name: file.name,
+          type: isPdf ? 'pdf' : 'image',
+          content, 
+          textData,
+          date: new Date().toLocaleDateString()
+        };
+
+        setFiles(prev => [...prev, newFile]);
+        if (!activeFileId) setActiveFileId(id);
+      };
+
+      if (isImage) {
+        reader.readAsDataURL(file);
+      } else if (isPdf) {
+        reader.readAsArrayBuffer(file);
+      }
+    }
+  };
+
+  const handleSendMessage = async () => {
+    if (!chatInput.trim() || !isKeyValid) return;
+
+    const userMessage = chatInput.trim();
+    setChatMessages(prev => [...prev, { role: 'user', text: userMessage }]);
+    setChatInput('');
+    setIsTyping(true);
+
+    const documentContext = files
+      .filter(f => f.type === 'pdf' && f.textData)
+      .map(f => `--- Document Reference: ${f.name} ---\n${f.textData.fullText}`)
+      .join('\n\n');
+
+    const systemPrompt = `You are a professional Abu Dhabi real‑estate investment assistant working for a property consultant who specializes in the UAE market, particularly Abu Dhabi.  
+    Your core job is to perform agentic multi‑document research and Q&A over the user’s uploaded documents and available tools, and then generate concise, persuasive, and financially sound outputs.
+
+    Follow this workflow strictly for every query:
+
+    1. Clarify the use case and user profile  
+    - First, infer or ask what the user is trying to achieve (e.g., investor comparison, end‑user home selection, payment‑plan explanation, objection handling).  
+    - Identify the client profile when possible: investor vs end user, income range, risk tolerance, family situation, time horizon, and preferred communities or developers.  
+    - Decide on the best output format (executive summary, bullet list for WhatsApp, structured table, mini‑presentation‑style text) and keep it consistent throughout the answer.
+
+    2. Prepare and use the document knowledge base (RAG)  
+    - Always assume there is a multi‑document knowledge base consisting of: project brochures, payment plans, community guides, FAQs, and internal notes.  
+    - For any query, first search the knowledge base for the most relevant chunks of information (brochures, payment plans, project specs, terms & conditions).  
+    - Prefer grounded answers: whenever possible, base your response on retrieved documents rather than general knowledge. If information is not found in the documents, state that clearly before making a carefully reasoned assumption.
+
+    3. Use tools for calculations and live market context  
+    - When the question involves prices, yields, ROIs, mortgage amounts, or payment schedules, call the appropriate calculator or code tool to compute:  
+      - Monthly installment, total interest, effective yield, ROI, cash‑on‑cash returns, and break‑even time.  
+    - When the user needs market context that is not in the documents (e.g., typical rental yields, current average prices in a community), use web or external tools if available, and clearly label such information as “market context” rather than document‑based facts.  
+    - Never guess numbers if a tool is available. Use the tool, then explain the result in simple language.
+
+    4. Plan the answer before writing it  
+    - Internally plan your response in steps:  
+      1) Understand the question and client profile.  
+      2) Retrieve and read the relevant documents.  
+      3) Decide what tools to call (RAG, calculator, web search).  
+      4) Combine all information into a structured, client‑friendly answer.  
+    - If the query is complex (e.g., “Compare Project A, B, C for a 10‑year investor”), break it into sub‑tasks and handle them one by one: understanding each project, computing numbers, then forming a comparison.
+
+    5. Response structure and communication style  
+    - Always start with a 2–3‑sentence executive summary in plain, confident language that a busy client can read quickly.  
+    - After the summary, organize the answer using clear headings and bullet points. Avoid long paragraphs.  
+    - When appropriate, include a comparison table (for example: columns for Project, Location, Price per sqm, Payment plan, Expected yield, Key pros, Key risks).  
+    - Use simple, non‑technical language while still sounding professional and knowledgeable.
+
+    6. Integrate NEP/NLP‑style persuasive communication  
+    - Highlight emotional and practical benefits, not only features: security, lifestyle, prestige, community, convenience, and long‑term financial peace of mind.  
+    - Address typical client fears: risk of delays, market downturns, liquidity, resale, and tenant demand. Proactively include reassurance grounded in facts from the documents when possible.  
+    - Use contrast: compare the recommended option with at least one alternative so the client feels they are choosing, not being pushed.  
+    - Use social proof where appropriate: “Many similar clients in X situation prefer…” but do not fabricate specific numbers or fake testimonials.
+
+    7. Task‑specific flows and templates  
+    For repeated real‑estate tasks, follow these patterns:
+
+    - Investor comparison flow:  
+      - Identify the client’s budget, time horizon, risk level, and target yield.  
+      - For each project, pull price, payment plan, handover date, expected rent, and key conditions from the documents.  
+      - Compute and present yield/ROI and payback period using tools.  
+      - Present pros, cons, and recommendation in bullets and, when useful, in a comparison table.
+
+    - WhatsApp/LinkedIn pitch flow:  
+      - Produce a short hook (1–2 lines) tailored to the client type.  
+      - Follow with 3–5 bullets: key benefits, financial highlights, location advantages, and urgency triggers (limited units, launch pricing, etc.) based on documents.  
+      - End with a low‑friction call to action (e.g., “Would you like a quick 5‑minute call or a sample payment plan?”).
+
+    - Payment plan explanation flow:  
+      - Extract the exact payment schedule and terms from the documents when available.  
+      - Simplify into clear steps (booking, during construction, on handover, post‑handover if applicable).  
+      - Translate complex percentages into real AED numbers using calculator tools, assuming the property price provided by the user or clearly stating the assumption.
+
+    8. Maintain accuracy and transparency  
+    - Distinguish clearly between:  
+      - Document‑based facts (brochure, payment plan, contract terms).  
+      - Tool‑based calculations (yields, ROI, mortgage installments).  
+      - Market context estimates or assumptions (clearly label as “approximate” and “for illustration”).  
+    - If documents conflict, say so and explain which one you prioritized and why.  
+    - If essential data is missing, explicitly ask the user for the missing inputs or state the assumptions you are making.
+
+    9. Adapt to integration environment and daily usage  
+    - Assume the assistant may be used inside a CRM, a web chat, or alongside WhatsApp and LinkedIn.  
+    - Prioritize answers that are easy to copy‑paste into a message to a client: concise, structured, with minimal formatting issues.  
+    - When relevant, suggest a short ready‑to‑send message version after the main analysis, labeled “Client‑ready version”.
+
+    10. Continuous improvement behavior  
+    - When you detect recurring questions or patterns, internally refine how you answer them: reuse effective structures and improve clarity.  
+    - When a query reveals gaps in the knowledge base (e.g., a missing project document), suggest to the user which document would improve future answers.  
+    - Always aim to save the consultant time by doing the research, calculations, structuring, and first‑draft writing, so they only need to review and personalize.
+
+    General rules:  
+    - Be concise but complete. Avoid unnecessary fluff.  
+    - Never invent specific prices, unit counts, or legal terms not present in the documents or tools; instead, request clarification or provide clearly marked illustrative examples.  
+    const systemPrompt = `You are a professional Abu Dhabi real‑estate investment assistant... (omitted for brevity)
+    PROVIDED LITERATURE / DATA CONTEXT (Use this as your Knowledge Base RAG):
+    ${documentContext || "No literature provided."}
+    `;
+
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+      const payload = {
+        // FIXED: Renamed systemInstruction to system_instruction to match API spec
+        system_instruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: "user", parts: [{ text: userMessage }] }]
+      };
+
+      const result = await fetchWithRetry(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const aiText = result.candidates?.[0]?.content?.parts?.[0]?.text || "Generation failed.";
+      setChatMessages(prev => [...prev, { role: 'model', text: aiText }]);
+    } catch (error) {
+      setChatMessages(prev => [...prev, { role: 'model', text: `System Error: ${error.message}` }]);
+    } finally {
+      setIsTyping(false);
+    }
+  };
+
+  // --- Calculations ---
+  const downPayment = financials.propertyPrice * (financials.downPaymentPct / 100);
+  const loanAmount = financials.propertyPrice - downPayment;
+  const monthlyRate = (financials.interestRate / 100) / 12;
+  const numPayments = financials.loanTermYears * 12;
+  
+  const monthlyMortgage = loanAmount > 0 && monthlyRate > 0 
+    ? (loanAmount * monthlyRate * Math.pow(1 + monthlyRate, numPayments)) / (Math.pow(1 + monthlyRate, numPayments) - 1)
+    : 0;
+
+  const annualMortgage = monthlyMortgage * 12;
+  const netOperatingIncome = financials.annualRent - financials.annualExpenses;
+  const netCashFlow = netOperatingIncome - annualMortgage;
+  const capRate = ((netOperatingIncome / financials.propertyPrice) * 100).toFixed(2);
+  const cashOnCashROI = downPayment > 0 ? ((netCashFlow / downPayment) * 100).toFixed(2) : 0;
+
+  const activeFile = files.find(f => f.id === activeFileId);
+
+  return (
+    <div className="min-h-screen bg-[#FDFDFD] text-[#111111] font-serif selection:bg-gray-200">
+      
+      {/* --- Paper Header --- */}
+      <header className="max-w-4xl mx-auto pt-16 pb-8 px-8 border-b border-gray-300 print:pt-8 print:pb-4">
+        <h1 className="text-3xl font-bold text-center mb-4 leading-tight">
+          Quantitative and Qualitative Assessment Framework for UAE Real Estate Assets
+        </h1>
+        <div className="text-center text-sm mb-6 text-gray-600">
+          <p>Investigative Notebook & Analytical Engine</p>
+          <p className="italic mt-1">Generated by User • {new Date().toLocaleDateString()}</p>
+        </div>
+
+        {/* Control Bar - Hidden on Print */}
+        <div className="print:hidden flex flex-wrap items-center justify-between gap-4 mt-8 pt-4 border-t border-gray-200 text-sm font-sans">
+          <div className="flex items-center space-x-2">
+            <Key size={14} className="text-gray-500" />
+            <input 
+              type="password" 
+              placeholder="Enter LLM Authorization Key..." 
+              value={apiKey}
+              onChange={handleApiChange}
+              className="border border-gray-300 rounded px-2 py-1 w-64 focus:outline-none focus:border-black transition-colors"
+            />
+            {isKeyValid ? (
+              <span className="text-green-600 text-xs font-semibold flex items-center">
+                <span className="w-2 h-2 rounded-full bg-green-500 mr-1 animate-pulse"></span> Valid
+              </span>
+            ) : (
+              <span className="text-red-500 text-xs flex items-center">
+                <AlertCircle size={12} className="mr-1" /> Required
+              </span>
+            )}
+          </div>
+          <button onClick={handlePrint} className="flex items-center space-x-1 border border-gray-300 hover:bg-gray-50 px-3 py-1 rounded transition-colors">
+            <Printer size={14} />
+            <span>Generate Report</span>
+          </button>
+        </div>
+      </header>
+
+      {/* --- Main Content Area --- */}
+      <main className="max-w-4xl mx-auto px-8 py-8 flex flex-col md:flex-row gap-12">
+        
+        {/* Left Column: Navigation & Data Sources */}
+        <aside className="w-full md:w-64 flex-shrink-0 print:hidden font-sans">
+          <div className="mb-8">
+            <h3 className="text-xs font-bold uppercase tracking-widest text-gray-500 mb-3 border-b border-gray-200 pb-1">
+              Methodology Navigation
+            </h3>
+            <nav className="space-y-1">
+              <button 
+                onClick={() => setActiveTab('analysis')}
+                className={`w-full text-left px-2 py-1.5 text-sm rounded ${activeTab === 'analysis' ? 'bg-gray-100 font-semibold' : 'hover:bg-gray-50 text-gray-600'}`}
+              >
+                1. Literature & Data Review
+              </button>
+              <button 
+                onClick={() => setActiveTab('financials')}
+                className={`w-full text-left px-2 py-1.5 text-sm rounded ${activeTab === 'financials' ? 'bg-gray-100 font-semibold' : 'hover:bg-gray-50 text-gray-600'}`}
+              >
+                2. Financial Projections
+              </button>
+              <button 
+                onClick={() => setActiveTab('topology')}
+                className={`w-full text-left px-2 py-1.5 text-sm rounded ${activeTab === 'topology' ? 'bg-gray-100 font-semibold' : 'hover:bg-gray-50 text-gray-600'}`}
+              >
+                3. Asset Topology Map
+              </button>
+            </nav>
+          </div>
+
+          <div>
+            <h3 className="text-xs font-bold uppercase tracking-widest text-gray-500 mb-3 border-b border-gray-200 pb-1 flex justify-between items-center">
+              <span>Source Materials</span>
+              <button onClick={() => fileInputRef.current?.click()} className="text-blue-600 hover:underline cursor-pointer">
+                + Add
+              </button>
+            </h3>
+            <input 
+              type="file" 
+              multiple 
+              accept=".pdf,image/*" 
+              ref={fileInputRef} 
+              className="hidden" 
+              onChange={handleFileUpload}
+            />
+            
+            {files.length === 0 ? (
+              <p className="text-sm text-gray-500 italic px-2">No datasets appended.</p>
+            ) : (
+              <ul className="space-y-1">
+                {files.map((f, i) => (
+                  <li key={f.id}>
+                    <button
+                      onClick={() => { setActiveTab('analysis'); setActiveFileId(f.id); }}
+                      className={`w-full text-left px-2 py-1.5 text-sm flex items-center space-x-2 rounded ${
+                        activeFileId === f.id && activeTab === 'analysis' ? 'bg-gray-100 font-medium' : 'hover:bg-gray-50 text-gray-600'
+                      }`}
+                    >
+                      <span className="text-xs text-gray-400">[{i+1}]</span>
+                      <span className="truncate flex-1">{f.name}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </aside>
+
+        {/* Center Column: Core Research Content */}
+        <section className="flex-1 min-w-0">
+          
+          {/* Section 1: Data Review */}
+          {activeTab === 'analysis' && (
+            <div className="animate-fade-in">
+              <h2 className="text-2xl font-bold mb-6 pb-2 border-b-2 border-black">
+                1. Data & Literature Review
+              </h2>
+              
+              {!activeFile ? (
+                <div className="py-12 text-center text-gray-500 italic">
+                  <p>Awaiting primary source materials.</p>
+                  <p className="text-sm mt-2">Please append PDF documents or imagery to begin analysis.</p>
+                </div>
+              ) : (
+                <div className="mb-8">
+                  <h3 className="text-lg font-bold mb-4 font-sans flex items-center">
+                    Fig 1.1: {activeFile.name}
+                  </h3>
+                  
+                  {activeFile.type === 'image' ? (
+                    <figure className="border border-gray-300 p-2 bg-gray-50">
+                      <img 
+                        src={activeFile.content} 
+                        alt={activeFile.name} 
+                        className="max-w-full h-auto mx-auto grayscale-0 hover:grayscale-[0.5] transition-all"
+                      />
+                      <figcaption className="text-sm text-center mt-2 text-gray-600 font-sans italic">
+                        Visual representation of asset.
+                      </figcaption>
+                    </figure>
+                  ) : (
+                    <div className="border border-gray-300 p-6 bg-[#FAFAFA] font-sans text-sm leading-relaxed overflow-y-auto max-h-[600px] print:max-h-none">
+                      <div className="mb-4 text-xs font-bold text-gray-500 uppercase tracking-widest border-b border-gray-200 pb-2">
+                        Extracted Text Content (N={activeFile.textData?.pageCount || 0} pages)
+                      </div>
+                      <div className="whitespace-pre-wrap">
+                        {activeFile.textData?.fullText 
+                          ? activeFile.textData.fullText.substring(0, 4000) + (activeFile.textData.fullText.length > 4000 ? '\n\n[...Text Truncated for Abstract. Full dataset available to analytical engine...]' : '') 
+                          : 'Processing linguistic data...'}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Section 2: Financials */}
+          {activeTab === 'financials' && (
+            <div className="animate-fade-in">
+              <h2 className="text-2xl font-bold mb-6 pb-2 border-b-2 border-black">
+                2. Quantitative Financial Projections
+              </h2>
+              
+              <p className="mb-6 text-gray-800 leading-relaxed">
+                The following computational model projects the fiscal viability of the target asset based on user-defined parameters relative to the UAE macroeconomic environment.
+              </p>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                {/* Inputs */}
+                <div className="print:hidden">
+                  <h3 className="text-sm font-bold font-sans uppercase tracking-widest text-gray-500 mb-4 border-b border-gray-200 pb-1">
+                    Input Variables
+                  </h3>
+                  <div className="space-y-4 font-sans text-sm">
+                    {[
+                      { label: 'Asset Valuation (AED)', key: 'propertyPrice' },
+                      { label: 'Equity Contribution (%)', key: 'downPaymentPct' },
+                      { label: 'Projected Annual Yield (AED)', key: 'annualRent' },
+                      { label: 'Estimated Opex (AED)', key: 'annualExpenses' },
+                      { label: 'Cost of Capital (%)', key: 'interestRate' },
+                      { label: 'Amortization Period (Yrs)', key: 'loanTermYears' }
+                    ].map(field => (
+                      <div key={field.key} className="flex justify-between items-center border-b border-gray-100 pb-2">
+                        <label className="text-gray-700">{field.label}</label>
+                        <input 
+                          type="number" 
+                          value={financials[field.key]}
+                          onChange={(e) => setFinancials({...financials, [field.key]: Number(e.target.value)})}
+                          className="w-32 text-right border border-gray-300 rounded px-2 py-1 focus:outline-none focus:border-black"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Outputs */}
+                <div>
+                  <h3 className="text-sm font-bold font-sans uppercase tracking-widest text-gray-500 mb-4 border-b border-gray-200 pb-1">
+                    Computed Metrics
+                  </h3>
+                  
+                  <div className="bg-gray-50 border border-gray-200 p-6 space-y-6">
+                    <div className="grid grid-cols-2 gap-4 text-center">
+                      <div>
+                        <div className="text-3xl font-serif mb-1">{capRate}%</div>
+                        <div className="text-xs font-sans uppercase text-gray-500">Capitalization Rate</div>
+                      </div>
+                      <div>
+                        <div className={`text-3xl font-serif mb-1 ${cashOnCashROI >= 0 ? '' : 'text-red-600'}`}>{cashOnCashROI}%</div>
+                        <div className="text-xs font-sans uppercase text-gray-500">Cash-on-Cash ROI</div>
+                      </div>
+                    </div>
+
+                    <hr className="border-gray-200" />
+
+                    <div className="space-y-3 font-sans text-sm">
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600">Net Operating Income (NOI)</span>
+                        <span className="font-mono">{netOperatingIncome.toLocaleString('en-US')} AED</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600">Required Equity</span>
+                        <span className="font-mono">{downPayment.toLocaleString('en-US')} AED</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-600">Debt Service (Monthly)</span>
+                        <span className="font-mono">{monthlyMortgage.toLocaleString('en-US', {maximumFractionDigits: 0})} AED</span>
+                      </div>
+                      <div className="flex justify-between items-center pt-2 border-t border-gray-200 font-bold">
+                        <span>Free Cash Flow (Monthly)</span>
+                        <span className={`font-mono ${netCashFlow >= 0 ? '' : 'text-red-600'}`}>
+                          {netCashFlow > 0 ? '+' : ''}{(netCashFlow / 12).toLocaleString('en-US', {maximumFractionDigits: 0})} AED
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Section 3: Mindmap / Topology */}
+          {activeTab === 'topology' && (
+            <div className="animate-fade-in">
+              <h2 className="text-2xl font-bold mb-6 pb-2 border-b-2 border-black">
+                3. Asset Topology & Material Index
+              </h2>
+              <p className="mb-8 text-gray-800 leading-relaxed">
+                A hierarchical representation of the current asset portfolio and associated documentation appended to this study.
+              </p>
+
+              <div className="border border-gray-300 p-8 min-h-[400px] flex justify-center items-start bg-white print:border-none print:p-0">
+                <div className="flex flex-col items-center w-full max-w-2xl font-sans text-sm">
+                  
+                  {/* Root */}
+                  <div className="border-2 border-black bg-white px-6 py-3 font-bold mb-8 z-10 text-center">
+                    UAE Investment Portfolio
+                    <div className="text-xs font-normal text-gray-500 mt-1 font-mono">Total Val: {financials.propertyPrice.toLocaleString()} AED</div>
+                  </div>
+
+                  <div className="relative w-full flex justify-around">
+                    {/* Connectors */}
+                    <div className="absolute top-0 left-1/4 right-1/4 h-px bg-gray-400"></div>
+                    <div className="absolute top-0 left-1/2 h-8 w-px bg-gray-400 -translate-y-8"></div>
+                    
+                    {/* Docs Node */}
+                    <div className="flex flex-col items-center w-1/2">
+                      <div className="h-8 w-px bg-gray-400 mb-0"></div>
+                      <div className="border border-gray-400 bg-gray-50 px-4 py-2 font-semibold mb-4 text-center w-40">
+                        Literature Index
+                      </div>
+                      <ul className="space-y-2 w-full max-w-[200px]">
+                        {files.filter(f => f.type === 'pdf').length === 0 && <li className="text-xs text-gray-400 italic text-center">Null</li>}
+                        {files.filter(f => f.type === 'pdf').map((f, i) => (
+                          <li key={f.id} className="border border-gray-200 px-3 py-2 text-xs truncate bg-white shadow-sm flex items-center">
+                            <span className="text-gray-400 mr-2 font-mono">[{i+1}]</span> {f.name}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    {/* Image Node */}
+                    <div className="flex flex-col items-center w-1/2">
+                      <div className="h-8 w-px bg-gray-400 mb-0"></div>
+                      <div className="border border-gray-400 bg-gray-50 px-4 py-2 font-semibold mb-4 text-center w-40">
+                        Visual Artifacts
+                      </div>
+                      <ul className="space-y-2 w-full max-w-[200px]">
+                        {files.filter(f => f.type === 'image').length === 0 && <li className="text-xs text-gray-400 italic text-center">Null</li>}
+                        {files.filter(f => f.type === 'image').map((f, i) => (
+                          <li key={f.id} className="border border-gray-200 px-3 py-2 text-xs truncate bg-white shadow-sm flex items-center">
+                            <span className="text-gray-400 mr-2 font-mono">[Fig]</span> {f.name}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* --- Analytical Chat Engine --- */}
+          <div className="mt-16 print:hidden">
+            <h2 className="text-2xl font-bold mb-6 pb-2 border-b-2 border-black">
+              Appendix A: Interactive Analytical Query Engine
+            </h2>
+            <p className="mb-4 text-sm text-gray-600 font-sans">
+              Interrogate the provided literature using the integrated LLM. Responses are constrained to the provided datasets where possible.
+            </p>
+
+            <div className="border border-gray-300 rounded-sm bg-[#FAFAFA] font-sans flex flex-col h-[500px]">
+              {/* Chat Log */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                {chatMessages.map((msg, idx) => (
+                  <div key={idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                    <div className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-1">
+                      {msg.role === 'user' ? 'Query (Investigator)' : 'Response (System)'}
+                    </div>
+                    <div className={`max-w-[85%] p-4 text-sm leading-relaxed ${
+                      msg.role === 'user' 
+                        ? 'bg-white border border-gray-200 shadow-sm' 
+                        : 'bg-gray-100 border-l-4 border-gray-800'
+                    }`}>
+                      {msg.text.split('\n').map((line, i) => (
+                        <span key={i}>
+                          {line.split(/(\*\*.*?\*\*)/).map((part, j) => 
+                            part.startsWith('**') && part.endsWith('**') 
+                              ? <strong key={j} className="font-semibold text-black">{part.slice(2, -2)}</strong>
+                              : part
+                          )}
+                          <br/>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+                {isTyping && (
+                  <div className="flex flex-col items-start">
+                     <div className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-1">Response (System)</div>
+                     <div className="bg-gray-100 border-l-4 border-gray-800 p-4 text-sm text-gray-500 italic">
+                        Synthesizing data...
+                     </div>
+                  </div>
+                )}
+                <div ref={chatEndRef} />
+              </div>
+
+              {/* Chat Input */}
+              <div className="p-4 border-t border-gray-300 bg-white">
+                <div className="relative flex items-center">
+                  <input 
+                    type="text" 
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                    placeholder={isKeyValid ? "Formulate a query regarding the literature..." : "Authorization Key required above to commence..."}
+                    disabled={!isKeyValid || isTyping}
+                    className="w-full pl-4 pr-12 py-3 border border-gray-300 focus:outline-none focus:border-black disabled:bg-gray-50 disabled:text-gray-400 text-sm"
+                  />
+                  <button 
+                    onClick={handleSendMessage}
+                    disabled={!isKeyValid || isTyping || !chatInput.trim()}
+                    className="absolute right-2 p-2 text-gray-600 hover:text-black disabled:text-gray-300 transition-colors"
+                  >
+                    <Send size={18} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </section>
+      </main>
+
+      {/* --- Footer --- */}
+      <footer className="max-w-4xl mx-auto py-8 text-center text-xs text-gray-500 font-sans border-t border-gray-200 mt-12 print:mt-4">
+        <p>Generated via LLM Interactive Protocol. Subject to review.</p>
+      </footer>
+
+      {/* CSS Additions */}
+      <style dangerouslySetInnerHTML={{__html: `
+        @import url('https://fonts.googleapis.com/css2?family=Merriweather:ital,wght@0,300;0,400;0,700;1,400&display=swap');
+        
+        body {
+          font-family: 'Merriweather', serif;
+        }
+
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(5px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+          animation: fadeIn 0.4s ease-out forwards;
+        }
+      `}} />
+    </div>
+  );
+}
